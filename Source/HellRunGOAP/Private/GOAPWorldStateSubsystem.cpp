@@ -23,7 +23,10 @@ bool UGOAPWorldStateSubsystem::SetSharedFact(const EGOAPFactScope Scope,
     if (Scope == EGOAPFactScope::Agent || !FactId.IsValid()) return false;
     TMap<FGuid,FGOAPWorldFactRecord>* Store = Scope == EGOAPFactScope::World
         ? &WorldFacts : &SquadFacts.FindOrAdd(SquadKey);
+    FGOAPWorldFactRecord OldRecord;
+    const bool bHadOldRecord=Store->RemoveAndCopyValue(FactId,OldRecord);
     FGOAPWorldFactRecord& Record=Store->FindOrAdd(FactId);
+    if(bHadOldRecord) Record=OldRecord;
     const double Now=GetWorld()?GetWorld()->GetTimeSeconds():0.0;
     const double NewExpiry=Lifetime>0.0f?Now+Lifetime:-1.0;
     const bool bChanged=!Record.Value.Equals(Value)
@@ -35,7 +38,9 @@ bool UGOAPWorldStateSubsystem::SetSharedFact(const EGOAPFactScope Scope,
     if(bChanged)
     {
         ++Revision;
-        NotifyChanged(Scope,SquadKey,FactId,TEXT("Shared fact value changed"));
+        NotifyChanged(Scope,SquadKey,FactId,EGOAPRuntimeEventType::FactSet,
+            bHadOldRecord?&OldRecord:nullptr,&Record,
+            TEXT("Shared fact value changed"));
     }
     return true;
 }
@@ -45,24 +50,31 @@ bool UGOAPWorldStateSubsystem::ClearSharedFact(const EGOAPFactScope Scope,
 {
     if (Scope==EGOAPFactScope::Agent) return false;
     bool bRemoved=false;
-    if(Scope==EGOAPFactScope::World) bRemoved=WorldFacts.Remove(FactId)>0;
+    FGOAPWorldFactRecord OldRecord;
+    if(Scope==EGOAPFactScope::World)
+        bRemoved=WorldFacts.RemoveAndCopyValue(FactId,OldRecord);
     else if(TMap<FGuid,FGOAPWorldFactRecord>* Store=SquadFacts.Find(SquadKey))
-        bRemoved=Store->Remove(FactId)>0;
+        bRemoved=Store->RemoveAndCopyValue(FactId,OldRecord);
     if(bRemoved)
     {
         ++Revision;
-        NotifyChanged(Scope,SquadKey,FactId,TEXT("Shared fact cleared"));
+        NotifyChanged(Scope,SquadKey,FactId,EGOAPRuntimeEventType::FactCleared,
+            &OldRecord,nullptr,TEXT("Shared fact cleared"));
     }
     return bRemoved;
 }
 
 void UGOAPWorldStateSubsystem::NotifyChanged(const EGOAPFactScope Scope,
-    const FName SquadKey,const FGuid& FactId,const FString& Reason)
+    const FName SquadKey,const FGuid& FactId,
+    const EGOAPRuntimeEventType EventType,
+    const FGOAPWorldFactRecord* OldRecord,
+    const FGOAPWorldFactRecord* NewRecord,const FString& Reason)
 {
     for(auto It=Brains.CreateIterator();It;++It)
     {
         if(!It->IsValid()){It.RemoveCurrent();continue;}
-        It->Get()->NotifySharedFactChanged(Scope,SquadKey,FactId,Reason);
+        It->Get()->NotifySharedFactChanged(Scope,SquadKey,FactId,EventType,
+            OldRecord,NewRecord,Reason);
     }
 }
 
@@ -74,8 +86,11 @@ void UGOAPWorldStateSubsystem::Tick(float DeltaTime)
         if(Pair.Value.IsExpired(Now)) ExpiredWorld.Add(Pair.Key);
     for(const FGuid& Id:ExpiredWorld)
     {
-        WorldFacts.Remove(Id); ++Revision;
-        NotifyChanged(EGOAPFactScope::World,NAME_None,Id,TEXT("World fact expired"));
+        FGOAPWorldFactRecord OldRecord;
+        WorldFacts.RemoveAndCopyValue(Id,OldRecord); ++Revision;
+        NotifyChanged(EGOAPFactScope::World,NAME_None,Id,
+            EGOAPRuntimeEventType::FactExpired,&OldRecord,nullptr,
+            TEXT("World fact expired"));
     }
     for(TPair<FName,TMap<FGuid,FGOAPWorldFactRecord>>& Squad:SquadFacts)
     {
@@ -84,8 +99,11 @@ void UGOAPWorldStateSubsystem::Tick(float DeltaTime)
             if(Pair.Value.IsExpired(Now)) ExpiredSquad.Add(Pair.Key);
         for(const FGuid& Id:ExpiredSquad)
         {
-            Squad.Value.Remove(Id); ++Revision;
-            NotifyChanged(EGOAPFactScope::Squad,Squad.Key,Id,TEXT("Squad fact expired"));
+            FGOAPWorldFactRecord OldRecord;
+            Squad.Value.RemoveAndCopyValue(Id,OldRecord); ++Revision;
+            NotifyChanged(EGOAPFactScope::Squad,Squad.Key,Id,
+                EGOAPRuntimeEventType::FactExpired,&OldRecord,nullptr,
+                TEXT("Squad fact expired"));
         }
     }
 }
@@ -113,5 +131,6 @@ bool UGOAPWorldStateSubsystem::GetSharedFact(const EGOAPFactScope Scope,
 void UGOAPWorldStateSubsystem::Deinitialize()
 {
     WorldFacts.Reset(); SquadFacts.Reset(); Brains.Reset();
+    DebugGroupOverrides.Reset(); DebugDrawLevel = 0;
     Super::Deinitialize();
 }

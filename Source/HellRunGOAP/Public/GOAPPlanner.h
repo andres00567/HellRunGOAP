@@ -8,7 +8,8 @@ class HELLRUNGOAP_API FGOAPPlanner
 public:
     static FGOAPPlanResult Plan(const FGOAPCompiledDomain& Domain,
         const FGOAPPlanningState& InitialState, const FGuid& GoalId,
-        int32 MaximumExpandedNodes = 256);
+        int32 MaximumExpandedNodes = 256,
+        const TSet<FGuid>* ExcludedActions = nullptr);
     /** Utility-order goal selection with feasibility fallback. A temporarily
      *  unreachable high-priority goal must not prevent a lower-priority
      *  executable plan from running. PreferredGoal is tried first while a
@@ -19,7 +20,8 @@ public:
         int32 MaximumExpandedNodes = 256,
         const FGuid& PreferredGoal = FGuid(),
         TArray<FGOAPGoalScore>* OutScores = nullptr,
-        FString* OutFailure = nullptr);
+        FString* OutFailure = nullptr,
+        const TSet<FGuid>* ExcludedActions = nullptr);
     static void ScoreGoals(const FGOAPCompiledDomain& Domain,
         const FGOAPPlanningState& State, TArray<FGOAPGoalScore>& OutScores);
 };

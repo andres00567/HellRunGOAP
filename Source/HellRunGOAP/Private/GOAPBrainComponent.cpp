@@ -13,6 +13,8 @@
 
 namespace
 {
+    int64 NextGOAPRuntimeEventSequence=1;
+
     TAutoConsoleVariable<int32> CVarHellRunGOAPDebug(
         TEXT("hellrun.ai.GOAPDebug"), 0,
         TEXT("GOAP diagnostics: 0=off, 1=goal/action, 2=goal/action and typed facts."),
@@ -28,9 +30,96 @@ UGOAPBrainComponent::UGOAPBrainComponent()
     PrimaryComponentTick.bStartWithTickEnabled=true;
 }
 
+FGOAPRuntimeEventNative UGOAPBrainComponent::AnyRuntimeEvent;
+
+FGOAPRuntimeEvent UGOAPBrainComponent::MakeRuntimeEvent(
+    const EGOAPRuntimeEventType Type,const FString& Reason)
+{
+    if(!RuntimeAgentId.IsValid()) RuntimeAgentId=FGuid::NewGuid();
+    FGOAPRuntimeEvent Event;
+    Event.Type=Type;
+    Event.WorldTime=GetWorld()?GetWorld()->GetTimeSeconds():0.0;
+    Event.Source=this;
+    Event.AgentId=RuntimeAgentId;
+    AActor* Agent=GetOwner();
+    if(const AController* Controller=Cast<AController>(Agent))
+        if(Controller->GetPawn()) Agent=Controller->GetPawn();
+    Event.AgentName=Agent?Agent->GetFName():NAME_None;
+    Event.AgentClass=Agent?Agent->GetClass()->GetFName():NAME_None;
+    Event.DomainName=Domain?Domain->GetFName():NAME_None;
+    Event.GoalId=ActiveGoalId;
+    if(const int32* GoalIndex=CompiledDomain.GoalIndices.Find(ActiveGoalId))
+        Event.GoalName=CompiledDomain.Goals[*GoalIndex].Name;
+    Event.ActionId=ActiveActionId;
+    if(const FGOAPCompiledAction* Action=FindAction(ActiveActionId))
+        Event.ActionName=Action->Name;
+    Event.ActionStatus=ActiveTask?ActiveTask->GetStatus()
+        :EGOAPTaskStatus::Inactive;
+    Event.Reason=Reason;
+    Event.LocalRevision=LocalRevision;
+    if(const UGOAPWorldStateSubsystem* State=GetWorld()
+        ?GetWorld()->GetSubsystem<UGOAPWorldStateSubsystem>():nullptr)
+        Event.WorldStateRevision=State->GetRevision();
+    return Event;
+}
+
+void UGOAPBrainComponent::EmitRuntimeEvent(FGOAPRuntimeEvent Event)
+{
+    Event.Sequence=NextGOAPRuntimeEventSequence++;
+    RuntimeEvent.Broadcast(Event);
+    AnyRuntimeEvent.Broadcast(Event);
+}
+
+void UGOAPBrainComponent::FillPlanEvent(FGOAPRuntimeEvent& Event,
+    const FGOAPPlanResult& Plan) const
+{
+    Event.GoalId=Plan.GoalId;
+    if(const int32* GoalIndex=CompiledDomain.GoalIndices.Find(Plan.GoalId))
+        Event.GoalName=CompiledDomain.Goals[*GoalIndex].Name;
+    Event.PlanActionIds=Plan.ActionIds;
+    for(const FGuid& ActionId:Plan.ActionIds)
+        if(const FGOAPCompiledAction* Action=FindAction(ActionId))
+            Event.PlanActionNames.Add(Action->Name);
+    Event.PlanCost=Plan.Cost;
+    Event.ExpandedNodes=Plan.ExpandedNodes;
+    Event.VisitedStates=Plan.VisitedStates;
+    Event.bPlanSucceeded=Plan.bSucceeded;
+}
+
+void UGOAPBrainComponent::EmitFactEvent(const EGOAPRuntimeEventType Type,
+    const FGOAPCompiledFact& Fact,const FGOAPWorldFactRecord* OldRecord,
+    const FGOAPWorldFactRecord* NewRecord,const FString& Reason)
+{
+    FGOAPRuntimeEvent Event=MakeRuntimeEvent(Type,Reason);
+    Event.FactId=Fact.Id;
+    Event.FactName=Fact.Name;
+    Event.FactScope=Fact.Scope;
+    if(OldRecord)
+    {
+        Event.bHadOldFactValue=true;
+        Event.OldFactValue=OldRecord->Value;
+    }
+    if(NewRecord)
+    {
+        Event.bHasNewFactValue=true;
+        Event.NewFactValue=NewRecord->Value;
+        Event.FactSource=NewRecord->Source;
+        Event.FactConfidence=NewRecord->Confidence;
+        Event.FactExpiresAt=NewRecord->ExpiresAt;
+    }
+    else if(OldRecord)
+    {
+        Event.FactSource=OldRecord->Source;
+        Event.FactConfidence=OldRecord->Confidence;
+        Event.FactExpiresAt=OldRecord->ExpiresAt;
+    }
+    EmitRuntimeEvent(MoveTemp(Event));
+}
+
 void UGOAPBrainComponent::BeginPlay()
 {
     Super::BeginPlay();
+    if(!RuntimeAgentId.IsValid()) RuntimeAgentId=FGuid::NewGuid();
     if(UGOAPWorldStateSubsystem* State=GetWorld()?GetWorld()->GetSubsystem<UGOAPWorldStateSubsystem>():nullptr)
         State->RegisterBrain(this);
     if(bStartLogicAutomatically) StartLogic();
@@ -54,7 +143,8 @@ bool UGOAPBrainComponent::StartLogic()
         for(const FText& Error:Errors) UE_LOG(LogTemp,Error,TEXT("GOAP %s: %s"),*GetNameSafe(GetOwner()),*Error.ToString());
         return false;
     }
-    AgentFacts.Reset(); Sensors.Reset();
+    AgentFacts.Reset(); Sensors.Reset(); ActionRetryAfter.Reset();
+    ConsecutiveActionFailures.Reset(); RecoveryReplanAt=-BIG_NUMBER;
     const double Now=GetWorld()?GetWorld()->GetTimeSeconds():0.0;
     const float AgentPhase=static_cast<float>(GetTypeHash(GetOwner()->GetFName())%1024u)/1024.0f;
     for(const UGOAPSensor* Template:Domain->Sensors)
@@ -65,20 +155,44 @@ bool UGOAPBrainComponent::StartLogic()
             Sensors.Add(Sensor);
         }
     bRunning=true; bReplanRequested=true; LastReplanReason=TEXT("Logic started");
+    EmitRuntimeEvent(MakeRuntimeEvent(EGOAPRuntimeEventType::LogicStarted,
+        LastReplanReason));
+    EmitRuntimeEvent(MakeRuntimeEvent(EGOAPRuntimeEventType::ReplanRequested,
+        LastReplanReason));
     SetComponentTickEnabled(true); return true;
 }
 
 void UGOAPBrainComponent::StopLogic(const FString& Reason)
 {
-    if(ActiveTask&&ActiveTask->GetStatus()==EGOAPTaskStatus::Running)
-        ActiveTask->Abort(Reason);
+    const bool bWasRunning=bRunning;
+    if(ActiveTask)
+    {
+        EGOAPTaskStatus Status=ActiveTask->GetStatus();
+        if(Status==EGOAPTaskStatus::Running
+            ||Status==EGOAPTaskStatus::Inactive)
+        {
+            ActiveTask->Abort(Reason);
+            Status=EGOAPTaskStatus::Aborted;
+        }
+        const FString CompletionReason=ActiveTask->GetCompletionReason().IsEmpty()
+            ?Reason:ActiveTask->GetCompletionReason();
+        FinishActiveAction(Status,CompletionReason,false);
+    }
+    if(bWasRunning)
+        EmitRuntimeEvent(MakeRuntimeEvent(EGOAPRuntimeEventType::LogicStopped,
+            Reason));
     ActiveTask=nullptr; ActiveActionId.Invalidate(); ActiveGoalId.Invalidate();
     CurrentPlan={}; RemainingActions.Reset(); bRunning=false;
     bPlanQueued=false;
 }
 
 void UGOAPBrainComponent::RequestReplan(const FString& Reason)
-{ bReplanRequested=true; LastReplanReason=Reason; }
+{
+    bReplanRequested=true;
+    LastReplanReason=Reason;
+    EmitRuntimeEvent(MakeRuntimeEvent(EGOAPRuntimeEventType::ReplanRequested,
+        Reason));
+}
 
 const FGOAPCompiledFact* UGOAPBrainComponent::FindFact(const FName Name,
     int32* OutIndex) const
@@ -109,7 +223,10 @@ bool UGOAPBrainComponent::SetFactById(const FGuid& FactId,const FGOAPValue& Valu
         return false;
     }
     const double Now=GetWorld()?GetWorld()->GetTimeSeconds():0.0;
+    FGOAPWorldFactRecord OldRecord;
+    const bool bHadOldRecord=AgentFacts.RemoveAndCopyValue(FactId,OldRecord);
     FGOAPWorldFactRecord& Record=AgentFacts.FindOrAdd(FactId);
+    if(bHadOldRecord) Record=OldRecord;
     // Source is diagnostic provenance, not part of the symbolic value. An
     // action effect and a sensor confirming the same fact must not bounce the
     // brain between identical plans merely because their labels differ.
@@ -119,6 +236,9 @@ bool UGOAPBrainComponent::SetFactById(const FGuid& FactId,const FGOAPValue& Valu
     if(bChanged)
     {
         ++LocalRevision;
+        EmitFactEvent(EGOAPRuntimeEventType::FactSet,Fact,
+            bHadOldRecord?&OldRecord:nullptr,&Record,
+            FString::Printf(TEXT("Fact set: %s"),*Fact.Name.ToString()));
         if(Fact.bTriggersReplan)
             RequestReplan(FString::Printf(TEXT("Fact changed: %s"),*Fact.Name.ToString()));
     }
@@ -143,37 +263,59 @@ void UGOAPBrainComponent::ExpireAgentFacts(const double Now)
         if(Pair.Value.IsExpired(Now)) Expired.Add(Pair.Key);
     for(const FGuid& Id:Expired)
     {
-        AgentFacts.Remove(Id); ++LocalRevision;
+        FGOAPWorldFactRecord OldRecord;
+        AgentFacts.RemoveAndCopyValue(Id,OldRecord); ++LocalRevision;
         if(const int32* Index=CompiledDomain.FactIndices.Find(Id))
-            if(CompiledDomain.Facts[*Index].bTriggersReplan)
+        {
+            const FGOAPCompiledFact& Fact=CompiledDomain.Facts[*Index];
+            EmitFactEvent(EGOAPRuntimeEventType::FactExpired,Fact,&OldRecord,
+                nullptr,FString::Printf(TEXT("Fact expired: %s"),
+                    *Fact.Name.ToString()));
+            if(Fact.bTriggersReplan)
                 RequestReplan(FString::Printf(TEXT("Fact expired: %s"),
-                    *CompiledDomain.Facts[*Index].Name.ToString()));
+                    *Fact.Name.ToString()));
+        }
     }
 }
 
 void UGOAPBrainComponent::NotifySharedFactChanged(const EGOAPFactScope Scope,
-    const FName ChangedSquad,const FGuid& FactId,const FString& Reason)
+    const FName ChangedSquad,const FGuid& FactId,
+    const EGOAPRuntimeEventType EventType,
+    const FGOAPWorldFactRecord* OldRecord,
+    const FGOAPWorldFactRecord* NewRecord,const FString& Reason)
 {
     if(!bRunning||Scope==EGOAPFactScope::Agent) return;
     if(Scope==EGOAPFactScope::Squad&&ChangedSquad!=SquadKey) return;
     const int32* Index=CompiledDomain.FactIndices.Find(FactId);
     if(!Index) return;
     const FGOAPCompiledFact& Fact=CompiledDomain.Facts[*Index];
-    if(Fact.Scope!=Scope||!Fact.bTriggersReplan) return;
+    if(Fact.Scope!=Scope) return;
     ++LocalRevision;
-    RequestReplan(Reason.IsEmpty()
-        ? FString::Printf(TEXT("Shared fact changed: %s"),*Fact.Name.ToString())
-        : Reason);
+    EmitFactEvent(EventType,Fact,OldRecord,NewRecord,Reason);
+    if(Fact.bTriggersReplan)
+        RequestReplan(Reason.IsEmpty()
+            ? FString::Printf(TEXT("Shared fact changed: %s"),*Fact.Name.ToString())
+            : Reason);
 }
 
 bool UGOAPBrainComponent::ClearFact(const FName FactName)
 {
     const FGOAPCompiledFact* Fact=FindFact(FactName); if(!Fact)return false;
     bool bRemoved=false;
-    if(Fact->Scope==EGOAPFactScope::Agent)bRemoved=AgentFacts.Remove(Fact->Id)>0;
+    FGOAPWorldFactRecord OldRecord;
+    if(Fact->Scope==EGOAPFactScope::Agent)
+        bRemoved=AgentFacts.RemoveAndCopyValue(Fact->Id,OldRecord);
     else if(UGOAPWorldStateSubsystem* State=GetWorld()?GetWorld()->GetSubsystem<UGOAPWorldStateSubsystem>():nullptr)
         bRemoved=State->ClearSharedFact(Fact->Scope,SquadKey,Fact->Id);
-    if(bRemoved){++LocalRevision;RequestReplan(FString::Printf(TEXT("Fact cleared: %s"),*FactName.ToString()));}
+    if(bRemoved&&Fact->Scope==EGOAPFactScope::Agent)
+    {
+        ++LocalRevision;
+        EmitFactEvent(EGOAPRuntimeEventType::FactCleared,*Fact,&OldRecord,
+            nullptr,FString::Printf(TEXT("Fact cleared: %s"),
+                *FactName.ToString()));
+        RequestReplan(FString::Printf(TEXT("Fact cleared: %s"),
+            *FactName.ToString()));
+    }
     return bRemoved;
 }
 
@@ -249,11 +391,25 @@ void UGOAPBrainComponent::TickSensors(const double Now)
 void UGOAPBrainComponent::Replan(const double Now)
 {
     FGOAPPlanningState State; if(!BuildPlanningState(State))return;
+    const FString RequestReason=LastReplanReason;
+    const FGuid PreviousGoalId=ActiveGoalId;
     const FGuid Preferred=ActiveGoalId.IsValid()&&Now<GoalCommitUntil
         ?ActiveGoalId:FGuid();
     FString SelectionFailure;
+    TSet<FGuid> ExcludedActions;
+    double EarliestRetry=BIG_NUMBER;
+    for(auto It=ActionRetryAfter.CreateIterator();It;++It)
+    {
+        if(It.Value()<=Now) It.RemoveCurrent();
+        else
+        {
+            ExcludedActions.Add(It.Key());
+            EarliestRetry=FMath::Min(EarliestRetry,It.Value());
+        }
+    }
     CurrentPlan=FGOAPPlanner::PlanBestEligibleGoal(CompiledDomain,State,
-        Domain->MaximumExpandedNodes,Preferred,&LastGoalScores,&SelectionFailure);
+        Domain->MaximumExpandedNodes,Preferred,&LastGoalScores,&SelectionFailure,
+        ExcludedActions.IsEmpty()?nullptr:&ExcludedActions);
     if(!CurrentPlan.bSucceeded)
     {
         if(bEnableTrace||CVarHellRunGOAPTrace.GetValueOnGameThread()!=0)
@@ -261,22 +417,41 @@ void UGOAPBrainComponent::Replan(const double Now)
                 TEXT("GOAP: agent=%s result=no-plan reason=%s request=%s"),
                 *GetNameSafe(GetOwner()),*SelectionFailure,
                 *LastReplanReason);
-        CurrentPlan={};RemainingActions.Reset();ActiveGoalId.Invalidate();
+        if(CurrentPlan.FailureReason.IsEmpty())
+            CurrentPlan.FailureReason=SelectionFailure;
+        RemainingActions.Reset();ActiveGoalId.Invalidate();
         bReplanRequested=false;LastPlanTime=Now;
-        LastReplanReason=SelectionFailure;
+        RecoveryReplanAt=EarliestRetry;
+        FGOAPRuntimeEvent Event=MakeRuntimeEvent(
+            EGOAPRuntimeEventType::PlanFailed,CurrentPlan.FailureReason);
+        FillPlanEvent(Event,CurrentPlan);
+        EmitRuntimeEvent(MoveTemp(Event));
+        OnPlanChanged.Broadcast(CurrentPlan);
         return;
     }
+    RecoveryReplanAt=-BIG_NUMBER;
     RemainingActions=CurrentPlan.ActionIds; ActiveGoalId=CurrentPlan.GoalId;
     const FGOAPGoalScore* Selected=LastGoalScores.FindByPredicate(
         [&](const FGOAPGoalScore& Score){return Score.GoalId==ActiveGoalId;});
-    if(!Selected)return;
     const int32* GoalIndex=CompiledDomain.GoalIndices.Find(ActiveGoalId);
     GoalCommitUntil=Now+(GoalIndex?CompiledDomain.Goals[*GoalIndex].CommitmentSeconds:0.0f);
     LastPlanTime=Now; bReplanRequested=false;
+    if(PreviousGoalId!=ActiveGoalId)
+    {
+        FGOAPRuntimeEvent GoalEvent=MakeRuntimeEvent(
+            EGOAPRuntimeEventType::GoalSelected,RequestReason);
+        GoalEvent.GoalId=ActiveGoalId;
+        GoalEvent.GoalName=GoalIndex?CompiledDomain.Goals[*GoalIndex].Name:NAME_None;
+        EmitRuntimeEvent(MoveTemp(GoalEvent));
+    }
+    FGOAPRuntimeEvent PlanEvent=MakeRuntimeEvent(
+        EGOAPRuntimeEventType::PlanSucceeded,RequestReason);
+    FillPlanEvent(PlanEvent,CurrentPlan);
+    EmitRuntimeEvent(MoveTemp(PlanEvent));
     OnPlanChanged.Broadcast(CurrentPlan);
     if(bEnableTrace||CVarHellRunGOAPTrace.GetValueOnGameThread()!=0)
         UE_LOG(LogTemp,Display,TEXT("GOAP: agent=%s goal=%s success=%d actions=%d cost=%.2f expanded=%d visited=%d reason=%s"),
-            *GetNameSafe(GetOwner()),*Selected->GoalName.ToString(),CurrentPlan.bSucceeded?1:0,
+            *GetNameSafe(GetOwner()),Selected?*Selected->GoalName.ToString():TEXT("None"),CurrentPlan.bSucceeded?1:0,
             CurrentPlan.ActionIds.Num(),CurrentPlan.Cost,CurrentPlan.ExpandedNodes,CurrentPlan.VisitedStates,*LastReplanReason);
 }
 
@@ -293,9 +468,14 @@ void UGOAPBrainComponent::BeginNextAction()
             ?Action->TaskClass.Get():UGOAPActionTask_Immediate::StaticClass());
     ActiveTask->Initialize(this,Action->Id);
     ActionStartedAt=GetWorld()?GetWorld()->GetTimeSeconds():0.0;
+    FGOAPRuntimeEvent StartedEvent=MakeRuntimeEvent(
+        EGOAPRuntimeEventType::ActionStarted,TEXT("Action activated"));
+    StartedEvent.ActionStatus=EGOAPTaskStatus::Running;
+    EmitRuntimeEvent(MoveTemp(StartedEvent));
+    OnActionChanged.Broadcast(Action->Name,EGOAPTaskStatus::Running);
     const EGOAPTaskStatus Started=ActiveTask->Activate();
-    OnActionChanged.Broadcast(Action->Name,Started);
-    if(Started==EGOAPTaskStatus::Succeeded||Started==EGOAPTaskStatus::Failed)
+    if(Started==EGOAPTaskStatus::Succeeded||Started==EGOAPTaskStatus::Failed
+        ||Started==EGOAPTaskStatus::Aborted)
         FinishActiveAction(Started,Started==EGOAPTaskStatus::Succeeded
             ?TEXT("Immediate action completed")
             :(ActiveTask->GetCompletionReason().IsEmpty()
@@ -303,11 +483,27 @@ void UGOAPBrainComponent::BeginNextAction()
                 :ActiveTask->GetCompletionReason()));
 }
 
-void UGOAPBrainComponent::FinishActiveAction(const EGOAPTaskStatus Status,const FString& Reason)
+void UGOAPBrainComponent::FinishActiveAction(const EGOAPTaskStatus Status,
+    const FString& Reason,const bool bRequestAnotherPlan)
 {
     const FGOAPCompiledAction* Action=FindAction(ActiveActionId);
+    if(Action)
+    {
+        EGOAPRuntimeEventType EventType=EGOAPRuntimeEventType::ActionFailed;
+        if(Reason.Equals(TEXT("Timeout"),ESearchCase::IgnoreCase))
+            EventType=EGOAPRuntimeEventType::ActionTimedOut;
+        else if(Status==EGOAPTaskStatus::Succeeded)
+            EventType=EGOAPRuntimeEventType::ActionSucceeded;
+        else if(Status==EGOAPTaskStatus::Aborted)
+            EventType=EGOAPRuntimeEventType::ActionAborted;
+        FGOAPRuntimeEvent Event=MakeRuntimeEvent(EventType,Reason);
+        Event.ActionStatus=Status;
+        EmitRuntimeEvent(MoveTemp(Event));
+    }
     if(Action&&Status==EGOAPTaskStatus::Succeeded)
     {
+        ActionRetryAfter.Remove(Action->Id);
+        ConsecutiveActionFailures.Remove(Action->Id);
         FGOAPPlanningState State; BuildPlanningState(State);
         for(const FGOAPEffect& Effect:Action->Effects)
         {
@@ -319,7 +515,22 @@ void UGOAPBrainComponent::FinishActiveAction(const EGOAPTaskStatus Status,const 
     if(Action)OnActionChanged.Broadcast(Action->Name,Status);
     ActiveTask=nullptr; ActiveActionId.Invalidate();
     if(Status!=EGOAPTaskStatus::Succeeded)
-    {RemainingActions.Reset();RequestReplan(FString::Printf(TEXT("Action failed: %s"),*Reason));}
+    {
+        if(Action&&(Status==EGOAPTaskStatus::Failed||Reason==TEXT("Timeout")))
+        {
+            const int32 FailureCount=ConsecutiveActionFailures.FindOrAdd(
+                Action->Id)+1;
+            ConsecutiveActionFailures.Add(Action->Id,FailureCount);
+            const double Now=GetWorld()?GetWorld()->GetTimeSeconds():0.0;
+            const float Cooldown=FMath::Min(MaximumActionFailureCooldown,
+                ActionFailureCooldown*FMath::Pow(2.0f,
+                    static_cast<float>(FMath::Min(FailureCount-1,3))));
+            ActionRetryAfter.Add(Action->Id,Now+Cooldown);
+        }
+        RemainingActions.Reset();
+        if(bRequestAnotherPlan&&!bReplanRequested)
+            RequestReplan(FString::Printf(TEXT("Action failed: %s"),*Reason));
+    }
 }
 
 void UGOAPBrainComponent::TickComponent(const float DeltaTime,const ELevelTick TickType,
@@ -330,7 +541,17 @@ void UGOAPBrainComponent::TickComponent(const float DeltaTime,const ELevelTick T
     const double Now=GetWorld()?GetWorld()->GetTimeSeconds():0.0;
     ExpireAgentFacts(Now);
     TickSensors(Now);
-    const int32 DebugLevel=CVarHellRunGOAPDebug.GetValueOnGameThread();
+    if(!bReplanRequested&&!ActiveTask&&RecoveryReplanAt>0.0
+        &&Now>=RecoveryReplanAt)
+    {
+        RecoveryReplanAt=-BIG_NUMBER;
+        RequestReplan(TEXT("Failed-action cooldown expired"));
+    }
+    const UGOAPWorldStateSubsystem* DebugState=GetWorld()
+        ?GetWorld()->GetSubsystem<UGOAPWorldStateSubsystem>():nullptr;
+    const int32 DebugLevel=FMath::Max(
+        CVarHellRunGOAPDebug.GetValueOnGameThread(),
+        DebugState?DebugState->GetDebugDrawLevel(DebugGroup):0);
     if(DebugLevel>0)
     {
         AActor* DisplayActor=GetOwner();
@@ -378,7 +599,12 @@ void UGOAPBrainComponent::TickComponent(const float DeltaTime,const ELevelTick T
     if(bReplanRequested&&!bPlanQueued&&Now-LastPlanTime>=Domain->MinimumReplanInterval)
     {
         if(UGOAPPlanningSubsystem* Planning=GetWorld()->GetSubsystem<UGOAPPlanningSubsystem>())
-        {bPlanQueued=Planning->Enqueue(this);}
+        {
+            bPlanQueued=Planning->Enqueue(this);
+            if(bPlanQueued)
+                EmitRuntimeEvent(MakeRuntimeEvent(
+                    EGOAPRuntimeEventType::PlanQueued,LastReplanReason));
+        }
     }
     if(bReplanRequested||bPlanQueued)
         return;

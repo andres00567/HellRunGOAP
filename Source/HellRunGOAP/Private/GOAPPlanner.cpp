@@ -19,13 +19,17 @@ namespace
     }
 
     float AdmissibleLowerBound(const TArray<FGOAPCondition>& Conditions,
-        const FGOAPCompiledDomain& Domain, const FGOAPPlanningState& State)
+        const FGOAPCompiledDomain& Domain, const FGOAPPlanningState& State,
+        const TSet<FGuid>* ExcludedActions)
     {
         if (Unsatisfied(Conditions, Domain, State) == 0) return 0.0f;
         float CheapestAction = TNumericLimits<float>::Max();
         for (const FGOAPCompiledAction& Action : Domain.Actions)
+        {
+            if (ExcludedActions && ExcludedActions->Contains(Action.Id)) continue;
             CheapestAction = FMath::Min(CheapestAction,
                 FMath::Max(0.001f, Action.Cost));
+        }
         return CheapestAction == TNumericLimits<float>::Max()
             ? 0.0f : CheapestAction;
     }
@@ -41,7 +45,7 @@ namespace
 
 FGOAPPlanResult FGOAPPlanner::Plan(const FGOAPCompiledDomain& Domain,
     const FGOAPPlanningState& InitialState, const FGuid& GoalId,
-    const int32 MaximumExpandedNodes)
+    const int32 MaximumExpandedNodes,const TSet<FGuid>* ExcludedActions)
 {
     FGOAPPlanResult Result; Result.GoalId=GoalId;
     const int32* GoalIndex=Domain.GoalIndices.Find(GoalId);
@@ -54,7 +58,8 @@ FGOAPPlanResult FGOAPPlanner::Plan(const FGOAPCompiledDomain& Domain,
     TArray<FNode,TInlineAllocator<128>> Open;
     TMap<FGOAPPlanningState,float> Best;
     FNode& Root=Open.AddDefaulted_GetRef(); Root.State=InitialState;
-    Root.Estimate=AdmissibleLowerBound(Goal.DesiredState,Domain,InitialState);
+    Root.Estimate=AdmissibleLowerBound(Goal.DesiredState,Domain,InitialState,
+        ExcludedActions);
     Best.Add(InitialState,0.0f);
     const int32 Limit=FMath::Clamp(MaximumExpandedNodes,8,4096);
     while(!Open.IsEmpty()&&Result.ExpandedNodes<Limit)
@@ -71,6 +76,7 @@ FGOAPPlanResult FGOAPPlanner::Plan(const FGOAPCompiledDomain& Domain,
         }
         for(const FGOAPCompiledAction& Action:Domain.Actions)
         {
+            if(ExcludedActions&&ExcludedActions->Contains(Action.Id))continue;
             if(!AllConditions(Action.Preconditions,Domain,Node.State)) continue;
             FGOAPPlanningState Next=Node.State;
             for(const FGOAPEffect& Effect:Action.Effects) GOAPApplyEffect(Effect,Domain,Next);
@@ -80,7 +86,8 @@ FGOAPPlanResult FGOAPPlanner::Plan(const FGOAPCompiledDomain& Domain,
             Best.Add(Next,NewCost);
             FNode& Child=Open.AddDefaulted_GetRef(); Child.State=MoveTemp(Next);
             Child.Cost=NewCost;
-            Child.Estimate=AdmissibleLowerBound(Goal.DesiredState,Domain,Child.State);
+            Child.Estimate=AdmissibleLowerBound(Goal.DesiredState,Domain,
+                Child.State,ExcludedActions);
             Child.Plan=Node.Plan; Child.Plan.Add(Action.Id);
         }
     }
@@ -93,7 +100,8 @@ FGOAPPlanResult FGOAPPlanner::Plan(const FGOAPCompiledDomain& Domain,
 FGOAPPlanResult FGOAPPlanner::PlanBestEligibleGoal(
     const FGOAPCompiledDomain& Domain,const FGOAPPlanningState& InitialState,
     const int32 MaximumExpandedNodes,const FGuid& PreferredGoal,
-    TArray<FGOAPGoalScore>* OutScores,FString* OutFailure)
+    TArray<FGOAPGoalScore>* OutScores,FString* OutFailure,
+    const TSet<FGuid>* ExcludedActions)
 {
     TArray<FGOAPGoalScore> LocalScores;
     TArray<FGOAPGoalScore>& Scores=OutScores?*OutScores:LocalScores;
@@ -109,10 +117,14 @@ FGOAPPlanResult FGOAPPlanner::PlanBestEligibleGoal(
         if(PreferredIndex>0)Candidates.Swap(0,PreferredIndex);
     }
     FString Failures;
+    int32 TotalExpandedNodes=0;
+    int32 TotalVisitedStates=0;
     for(const FGOAPGoalScore* Candidate:Candidates)
     {
         FGOAPPlanResult Attempt=Plan(Domain,InitialState,Candidate->GoalId,
-            MaximumExpandedNodes);
+            MaximumExpandedNodes,ExcludedActions);
+        TotalExpandedNodes+=Attempt.ExpandedNodes;
+        TotalVisitedStates+=Attempt.VisitedStates;
         if(Attempt.bSucceeded&&!Attempt.ActionIds.IsEmpty())
         {
             if(OutFailure)OutFailure->Reset();
@@ -124,6 +136,8 @@ FGOAPPlanResult FGOAPPlanner::PlanBestEligibleGoal(
                 ?TEXT("already converged"):*Attempt.FailureReason);
     }
     FGOAPPlanResult Failed;
+    Failed.ExpandedNodes=TotalExpandedNodes;
+    Failed.VisitedStates=TotalVisitedStates;
     Failed.FailureReason=Candidates.IsEmpty()
         ?TEXT("No eligible unsatisfied goal")
         :FString::Printf(TEXT("No executable eligible goal (%s)"),*Failures);

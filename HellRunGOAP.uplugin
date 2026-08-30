@@ -8,6 +8,9 @@
   "CreatedBy": "Hell Run",
   "CanContainContent": true,
   "IsBetaVersion": true,
+  "Plugins": [
+    { "Name": "ToolsetRegistry", "Enabled": true, "TargetAllowList": ["Editor"] }
+  ],
   "Modules": [
     {
       "Name": "HellRunGOAP",
@@ -17,7 +20,7 @@
     {
       "Name": "HellRunGOAPEditor",
       "Type": "Editor",
-      "LoadingPhase": "Default"
+      "LoadingPhase": "PostEngineInit"
     }
   ]
 }

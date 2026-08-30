@@ -10,7 +10,7 @@ public class HellRunGOAPEditor : ModuleRules
             "Core", "CoreUObject", "Engine", "HellRunGOAP",
             "UnrealEd", "AssetTools", "GraphEditor", "PropertyEditor",
             "Slate", "SlateCore", "ToolMenus", "EditorFramework",
-            "ApplicationCore", "InputCore"
+            "ApplicationCore", "InputCore", "ToolsetRegistry"
         });
     }
 }

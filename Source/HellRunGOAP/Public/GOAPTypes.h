@@ -61,6 +61,28 @@ enum class EGOAPTaskStatus : uint8
     Aborted,
 };
 
+/** Authoritative runtime transitions emitted by a GOAP brain. Spatial samples
+ * remain a separate, lower-frequency debugger concern. */
+UENUM(BlueprintType)
+enum class EGOAPRuntimeEventType : uint8
+{
+    LogicStarted,
+    LogicStopped,
+    ReplanRequested,
+    PlanQueued,
+    PlanSucceeded,
+    PlanFailed,
+    GoalSelected,
+    ActionStarted,
+    ActionSucceeded,
+    ActionFailed,
+    ActionAborted,
+    ActionTimedOut,
+    FactSet,
+    FactCleared,
+    FactExpired,
+};
+
 USTRUCT(BlueprintType)
 struct HELLRUNGOAP_API FGOAPValue
 {
@@ -366,6 +388,112 @@ struct HELLRUNGOAP_API FGOAPBrainDebugSnapshot
     FString LastReplanReason;
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP")
+    int32 WorldStateRevision = 0;
+};
+
+/** Typed debugger payload copied synchronously at the transition that produced
+ * it. Consumers must not retain Source as an owning reference. */
+USTRUCT(BlueprintType)
+struct HELLRUNGOAP_API FGOAPRuntimeEvent
+{
+    GENERATED_BODY()
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    int64 Sequence = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    double WorldTime = 0.0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    EGOAPRuntimeEventType Type = EGOAPRuntimeEventType::LogicStarted;
+
+    /** Native-only weak source. AgentId remains valid after this expires. */
+    UPROPERTY(Transient)
+    TWeakObjectPtr<UObject> Source;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    FGuid AgentId;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    FName AgentName;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    FName AgentClass;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    FName DomainName;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    FGuid GoalId;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    FName GoalName;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    FGuid ActionId;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    FName ActionName;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    EGOAPTaskStatus ActionStatus = EGOAPTaskStatus::Inactive;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    TArray<FGuid> PlanActionIds;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    TArray<FName> PlanActionNames;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    float PlanCost = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    int32 ExpandedNodes = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    int32 VisitedStates = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    bool bPlanSucceeded = false;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    FString Reason;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    FGuid FactId;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    FName FactName;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    EGOAPFactScope FactScope = EGOAPFactScope::Agent;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    bool bHadOldFactValue = false;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    FGOAPValue OldFactValue;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    bool bHasNewFactValue = false;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    FGOAPValue NewFactValue;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    FName FactSource;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    float FactConfidence = 1.0f;
+
+    /** Absolute world time. Negative means the fact does not expire. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    double FactExpiresAt = -1.0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
+    int32 LocalRevision = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="GOAP|Debug")
     int32 WorldStateRevision = 0;
 };
 

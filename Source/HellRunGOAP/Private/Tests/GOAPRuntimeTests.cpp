@@ -187,4 +187,41 @@ bool FGOAPFallsBackFromUnreachablePriorityGoal::RunTest(const FString&)
     return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGOAPSkipsFailedAction,
+    "HellRun.GOAP.Recovery.SkipsFailedAction",
+    EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+
+bool FGOAPSkipsFailedAction::RunTest(const FString&)
+{
+    UGOAPDomain* D=NewObject<UGOAPDomain>();
+    D->Facts.Add(Fact(TEXT("Engaged"),EGOAPValueType::Bool,
+        FGOAPValue::MakeBool(false)));
+    UGOAPActionDefinition* Cheap=NewObject<UGOAPActionDefinition>(D);
+    Cheap->EnsureId();Cheap->Name=TEXT("BlockedRoute");Cheap->Cost=1.0f;
+    Cheap->Effects.Add(Sets(D->Facts[0],FGOAPValue::MakeBool(true)));
+    D->Actions.Add(Cheap);
+    UGOAPActionDefinition* Recovery=NewObject<UGOAPActionDefinition>(D);
+    Recovery->EnsureId();Recovery->Name=TEXT("UsableFallback");Recovery->Cost=2.0f;
+    Recovery->Effects.Add(Sets(D->Facts[0],FGOAPValue::MakeBool(true)));
+    D->Actions.Add(Recovery);
+    UGOAPGoalDefinition* Goal=NewObject<UGOAPGoalDefinition>(D);
+    Goal->EnsureId();Goal->Name=TEXT("Engage");
+    Goal->DesiredState.Add(Equals(D->Facts[0],FGOAPValue::MakeBool(true)));
+    D->Goals.Add(Goal);
+    FGOAPCompiledDomain Compiled;TArray<FText> Errors;
+    TestTrue(TEXT("Domain compiles"),D->Compile(Compiled,&Errors));
+    FGOAPPlanningState State;
+    for(const auto& F:Compiled.Facts)State.Values.Add(F.DefaultValue);
+    TSet<FGuid> Excluded;Excluded.Add(Cheap->Id);
+    const FGOAPPlanResult Plan=FGOAPPlanner::PlanBestEligibleGoal(
+        Compiled,State,64,FGuid(),nullptr,nullptr,&Excluded);
+    TestTrue(TEXT("Planner finds an alternative to the failed action"),
+        Plan.bSucceeded);
+    TestEqual(TEXT("Fallback plan contains one action"),Plan.ActionIds.Num(),1);
+    if(Plan.ActionIds.Num()==1)
+        TestEqual(TEXT("Failed action is not immediately repeated"),
+            Plan.ActionIds[0],Recovery->Id);
+    return true;
+}
+
 #endif
